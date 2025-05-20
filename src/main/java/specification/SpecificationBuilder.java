@@ -23,6 +23,19 @@ public class SpecificationBuilder<T> {
                 Object value = field.get(searchDto);
                 if (value == null) continue;
 
+                QueryTerm queryTerm = field.getAnnotation(QueryTerm.class);
+                if (queryTerm != null && value instanceof String termValue && !termValue.isBlank()) {
+                    List<Specification<T>> orSpecs = new ArrayList<>();
+                    for (String path : queryTerm.value()) {
+                        orSpecs.add(buildPredicate(path, termValue, queryTerm.operation()));
+                    }
+                    Specification<T> combinedOr = orSpecs.stream().reduce(Specification::or).orElse(null);
+                    if (combinedOr != null) {
+                        specifications.add(combinedOr);
+                    }
+                    continue;
+                }
+
                 QueryRange rangeAnnotation = field.getAnnotation(QueryRange.class);
                 if (rangeAnnotation != null && value instanceof Range<?> range) {
                     String path = rangeAnnotation.value();
