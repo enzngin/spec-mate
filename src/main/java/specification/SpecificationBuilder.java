@@ -37,30 +37,38 @@ public class SpecificationBuilder<T> {
     ) {}
 
     public Specification<T> build(Object searchDto) {
-        // Get cached field metadata - reflection only happens once per class type
         List<FieldMetadata> fields = getFieldMetadata(searchDto.getClass());
 
-        // Build all predicates in a single lambda to share JOIN cache
         return (root, query, cb) -> {
-            // JOIN cache: key = path (e.g., "author"), value = Join instance
+            // Cache: key = path (örn: "author"), value = Join instance
             java.util.Map<String, jakarta.persistence.criteria.Join<?, ?>> joinCache = new java.util.HashMap<>();
 
-            // Collect paths that need FETCH JOIN to prevent N+1
+            // 1. Fetch Path'lerini Topla
             java.util.Set<String> fetchPaths = new java.util.HashSet<>();
             collectFetchPaths(fields, searchDto, fetchPaths);
 
-            // Apply FETCH JOINs to prevent N+1 problem
-            for (String fetchPath : fetchPaths) {
-                try {
-                    root.fetch(fetchPath, JoinType.LEFT);
-                } catch (Exception e) {
-                    // If fetch fails, ignore (might be already fetched or unsupported)
+            // 2. Fetch İşlemlerini Yap ve CACHE'E EKLE (Fix Burada!)
+            if (!fetchPaths.isEmpty()) {
+                // Distinct şart, çünkü fetch yapınca kartezyen çarpım ihtimali doğar
+                if (query != null) {
+                    query.distinct(true);
                 }
-            }
 
-            // Make query distinct to avoid duplicate results from JOINs
-            if (!fetchPaths.isEmpty() && query != null) {
-                query.distinct(true);
+                for (String fetchPath : fetchPaths) {
+                    try {
+                        // Fetch nesnesini oluştur ve YAKALA
+                        jakarta.persistence.criteria.Fetch<?, ?> fetch = root.fetch(fetchPath, JoinType.LEFT);
+
+                        // KRİTİK NOKTA: Fetch nesnesi aslında bir Join'dir.
+                        // Bunu cast edip cache'e atarsak, aşağıdaki filtreleme mantığı
+                        // "yeni join" oluşturmak yerine bu fetch nesnesini kullanır.
+                        if (fetch instanceof jakarta.persistence.criteria.Join) {
+                            joinCache.put(fetchPath, (jakarta.persistence.criteria.Join<?, ?>) fetch);
+                        }
+                    } catch (Exception e) {
+                        // Zaten fetch edilmiş olabilir, yut.
+                    }
+                }
             }
 
             List<jakarta.persistence.criteria.Predicate> predicates = new ArrayList<>();
@@ -70,11 +78,13 @@ public class SpecificationBuilder<T> {
                     Object value = metadata.field().get(searchDto);
                     if (value == null) continue;
 
-                    // Process @QueryTerm annotation
+                    // --- QueryTerm İşlemleri ---
                     if (metadata.queryTerm() != null && value instanceof String termValue && !termValue.isBlank()) {
                         List<jakarta.persistence.criteria.Predicate> orPredicates = new ArrayList<>();
                         for (String path : metadata.queryTerm().value()) {
+                            // Burada artık joinCache dolu olduğu için var olan FETCH nesnesini kullanacak
                             Path<?> targetPath = resolvePathWithJoinCache(root, path, joinCache);
+
                             if (metadata.queryTerm().operation() == Operation.LIKE) {
                                 orPredicates.add(cb.like(cb.lower(targetPath.as(String.class)), "%" + termValue.toLowerCase() + "%"));
                             } else {
@@ -87,7 +97,7 @@ public class SpecificationBuilder<T> {
                         continue;
                     }
 
-                    // Process @QueryRange annotation
+                    // --- QueryRange İşlemleri ---
                     if (metadata.queryRange() != null && value instanceof Range<?> range) {
                         String path = metadata.queryRange().value();
                         Path<Comparable<Object>> targetPath = (Path<Comparable<Object>>) resolvePathWithJoinCache(root, path, joinCache);
@@ -102,10 +112,11 @@ public class SpecificationBuilder<T> {
                         continue;
                     }
 
-                    // Process @QueryPath annotation or plain field
+                    // --- QueryPath İşlemleri ---
                     String path = (metadata.queryPath() != null) ? metadata.queryPath().value() : metadata.field().getName();
                     Operation operation = (metadata.queryPath() != null) ? metadata.queryPath().operation() : Operation.EQUAL;
 
+                    // resolvePathWithJoinCache burada da cache'den okuyacak
                     Path<?> targetPath = resolvePathWithJoinCache(root, path, joinCache);
 
                     if (value instanceof Collection<?> collection) {
