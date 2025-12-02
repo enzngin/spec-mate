@@ -39,108 +39,116 @@ public class SpecificationBuilder<T> {
     public Specification<T> build(Object searchDto) {
         // Get cached field metadata - reflection only happens once per class type
         List<FieldMetadata> fields = getFieldMetadata(searchDto.getClass());
-        List<Specification<T>> specifications = new ArrayList<>();
 
-        for (FieldMetadata metadata : fields) {
-            try {
-                Object value = metadata.field().get(searchDto);
-                if (value == null) continue;
+        // Build all predicates in a single lambda to share JOIN cache
+        return (root, query, cb) -> {
+            // JOIN cache: key = path (e.g., "author"), value = Join instance
+            java.util.Map<String, jakarta.persistence.criteria.Join<?, ?>> joinCache = new java.util.HashMap<>();
+            List<jakarta.persistence.criteria.Predicate> predicates = new ArrayList<>();
 
-                // Process @QueryTerm annotation
-                if (metadata.queryTerm() != null && value instanceof String termValue && !termValue.isBlank()) {
-                    List<Specification<T>> orSpecs = new ArrayList<>();
-                    for (String path : metadata.queryTerm().value()) {
-                        orSpecs.add(buildPredicate(path, termValue, metadata.queryTerm().operation()));
+            for (FieldMetadata metadata : fields) {
+                try {
+                    Object value = metadata.field().get(searchDto);
+                    if (value == null) continue;
+
+                    // Process @QueryTerm annotation
+                    if (metadata.queryTerm() != null && value instanceof String termValue && !termValue.isBlank()) {
+                        List<jakarta.persistence.criteria.Predicate> orPredicates = new ArrayList<>();
+                        for (String path : metadata.queryTerm().value()) {
+                            Path<?> targetPath = resolvePathWithJoinCache(root, path, joinCache);
+                            if (metadata.queryTerm().operation() == Operation.LIKE) {
+                                orPredicates.add(cb.like(cb.lower(targetPath.as(String.class)), "%" + termValue.toLowerCase() + "%"));
+                            } else {
+                                orPredicates.add(cb.equal(targetPath, termValue));
+                            }
+                        }
+                        if (!orPredicates.isEmpty()) {
+                            predicates.add(cb.or(orPredicates.toArray(new jakarta.persistence.criteria.Predicate[0])));
+                        }
+                        continue;
                     }
-                    Specification<T> combinedOr = orSpecs.stream().reduce(Specification::or).orElse(null);
-                    if (combinedOr != null) {
-                        specifications.add(combinedOr);
+
+                    // Process @QueryRange annotation
+                    if (metadata.queryRange() != null && value instanceof Range<?> range) {
+                        String path = metadata.queryRange().value();
+                        Path<Comparable<Object>> targetPath = (Path<Comparable<Object>>) resolvePathWithJoinCache(root, path, joinCache);
+
+                        if (range.getFrom() != null && range.getTo() != null) {
+                            predicates.add(cb.between(targetPath, (Comparable<Object>) range.getFrom(), (Comparable<Object>) range.getTo()));
+                        } else if (range.getFrom() != null) {
+                            predicates.add(cb.greaterThanOrEqualTo(targetPath, (Comparable<Object>) range.getFrom()));
+                        } else if (range.getTo() != null) {
+                            predicates.add(cb.lessThanOrEqualTo(targetPath, (Comparable<Object>) range.getTo()));
+                        }
+                        continue;
                     }
-                    continue;
-                }
 
-                // Process @QueryRange annotation
-                if (metadata.queryRange() != null && value instanceof Range<?> range) {
-                    String path = metadata.queryRange().value();
-                    if (range.getFrom() != null && range.getTo() != null) {
-                        specifications.add(buildBetweenPredicate(path, range.getFrom(), range.getTo()));
-                    } else if (range.getFrom() != null) {
-                        specifications.add(buildGreaterThanOrEqualToPredicate(path, range.getFrom()));
-                    } else if (range.getTo() != null) {
-                        specifications.add(buildLessThanOrEqualToPredicate(path, range.getTo()));
+                    // Process @QueryPath annotation or plain field
+                    String path = (metadata.queryPath() != null) ? metadata.queryPath().value() : metadata.field().getName();
+                    Operation operation = (metadata.queryPath() != null) ? metadata.queryPath().operation() : Operation.EQUAL;
+
+                    Path<?> targetPath = resolvePathWithJoinCache(root, path, joinCache);
+
+                    if (value instanceof Collection<?> collection) {
+                        if (!collection.isEmpty()) {
+                            var inClause = cb.in((jakarta.persistence.criteria.Expression<Object>) targetPath);
+                            for (Object item : collection) {
+                                inClause.value(item);
+                            }
+                            predicates.add(inClause);
+                        }
+                    } else {
+                        if (operation == Operation.LIKE && value instanceof String stringValue) {
+                            predicates.add(cb.like(cb.lower(targetPath.as(String.class)), "%" + stringValue.toLowerCase() + "%"));
+                        } else {
+                            predicates.add(cb.equal(targetPath, value));
+                        }
                     }
-                    continue;
+
+                } catch (IllegalAccessException e) {
+                    throw new RuntimeException("DTO alanına erişilemedi: " + metadata.field().getName(), e);
                 }
-
-                // Process @QueryPath annotation or plain field
-                String path = (metadata.queryPath() != null) ? metadata.queryPath().value() : metadata.field().getName();
-                Operation operation = (metadata.queryPath() != null) ? metadata.queryPath().operation() : Operation.EQUAL;
-
-                if (value instanceof Collection<?> collection) {
-                    specifications.add(buildInPredicate(path, collection));
-                } else {
-                    specifications.add(buildPredicate(path, value, operation));
-                }
-
-            } catch (IllegalAccessException e) {
-                throw new RuntimeException("DTO alanına erişilemedi: " + metadata.field().getName(), e);
             }
-        }
 
-        return specifications.stream()
-                .reduce(Specification::and)
-                .orElse(null);
-    }
-
-    private Specification<T> buildPredicate(String pathExpression, Object value, Operation operation) {
-        return (root, query, cb) -> {
-            Path<?> targetPath = resolvePath(root, pathExpression);
-
-            if (operation == Operation.LIKE && value instanceof String stringValue) {
-                return cb.like(cb.lower(targetPath.as(String.class)), "%" + stringValue.toLowerCase() + "%");
-            } else {
-                return cb.equal(targetPath, value);
-            }
+            return predicates.isEmpty() ? cb.conjunction() : cb.and(predicates.toArray(new jakarta.persistence.criteria.Predicate[0]));
         };
     }
 
-    private Specification<T> buildBetweenPredicate(String pathExpression, Object from, Object to) {
-        return (root, query, cb) -> {
-            Path<Comparable<Object>> path = (Path<Comparable<Object>>) resolvePath(root, pathExpression);
-            return cb.between(path, (Comparable<Object>) from, (Comparable<Object>) to);
-        };
-    }
-
-    private Specification<T> buildGreaterThanOrEqualToPredicate(String pathExpression, Object from) {
-        return (root, query, cb) -> {
-            Path<Comparable<Object>> path = (Path<Comparable<Object>>) resolvePath(root, pathExpression);
-            return cb.greaterThanOrEqualTo(path, (Comparable<Object>) from);
-        };
-    }
-
-    private Specification<T> buildLessThanOrEqualToPredicate(String pathExpression, Object to) {
-        return (root, query, cb) -> {
-            Path<Comparable<Object>> path = (Path<Comparable<Object>>) resolvePath(root, pathExpression);
-            return cb.lessThanOrEqualTo(path, (Comparable<Object>) to);
-        };
-    }
-
-    private Specification<T> buildInPredicate(String pathExpression, Collection<?> values) {
-        return (root, query, cb) -> {
-            Path<Object> path = (Path<Object>) resolvePath(root, pathExpression);
-            var inClause = cb.in(path);
-            values.forEach(inClause::value);
-            return inClause;
-        };
-    }
-
-    private Path<?> resolvePath(From<?, ?> root, String pathExpression) {
+    /**
+     * Resolves a path expression with JOIN deduplication.
+     * Uses a cache to ensure that the same relationship is only joined once,
+     * preventing duplicate JOINs in the generated SQL.
+     *
+     * @param root The root entity
+     * @param pathExpression Path expression (e.g., "author.firstName")
+     * @param joinCache Cache to store and reuse JOIN instances
+     * @return Resolved path
+     */
+    private Path<?> resolvePathWithJoinCache(From<?, ?> root, String pathExpression,
+                                             java.util.Map<String, jakarta.persistence.criteria.Join<?, ?>> joinCache) {
         String[] parts = pathExpression.split("\\.");
-        From<?, ?> join = root;
+        From<?, ?> current = root;
+
+        // Navigate through the path, reusing existing JOINs
+        StringBuilder pathBuilder = new StringBuilder();
         for (int i = 0; i < parts.length - 1; i++) {
-            join = join.join(parts[i], JoinType.LEFT);
+            if (i > 0) pathBuilder.append(".");
+            pathBuilder.append(parts[i]);
+
+            String joinPath = pathBuilder.toString();
+
+            // Check if JOIN already exists in cache
+            jakarta.persistence.criteria.Join<?, ?> join = joinCache.get(joinPath);
+            if (join == null) {
+                // Create new JOIN and cache it
+                join = current.join(parts[i], JoinType.LEFT);
+                joinCache.put(joinPath, join);
+            }
+            current = join;
         }
-        return join.get(parts[parts.length - 1]);
+
+        // Return the final field path
+        return current.get(parts[parts.length - 1]);
     }
 
     /**
