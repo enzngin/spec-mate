@@ -44,6 +44,25 @@ public class SpecificationBuilder<T> {
         return (root, query, cb) -> {
             // JOIN cache: key = path (e.g., "author"), value = Join instance
             java.util.Map<String, jakarta.persistence.criteria.Join<?, ?>> joinCache = new java.util.HashMap<>();
+
+            // Collect paths that need FETCH JOIN to prevent N+1
+            java.util.Set<String> fetchPaths = new java.util.HashSet<>();
+            collectFetchPaths(fields, searchDto, fetchPaths);
+
+            // Apply FETCH JOINs to prevent N+1 problem
+            for (String fetchPath : fetchPaths) {
+                try {
+                    root.fetch(fetchPath, JoinType.LEFT);
+                } catch (Exception e) {
+                    // If fetch fails, ignore (might be already fetched or unsupported)
+                }
+            }
+
+            // Make query distinct to avoid duplicate results from JOINs
+            if (!fetchPaths.isEmpty() && query != null) {
+                query.distinct(true);
+            }
+
             List<jakarta.persistence.criteria.Predicate> predicates = new ArrayList<>();
 
             for (FieldMetadata metadata : fields) {
@@ -149,6 +168,57 @@ public class SpecificationBuilder<T> {
 
         // Return the final field path
         return current.get(parts[parts.length - 1]);
+    }
+
+    /**
+     * Collects all root paths that need FETCH JOIN to prevent N+1 problem.
+     * Detects nested paths (e.g., "author.firstName") and extracts root path ("author").
+     *
+     * @param fields Field metadata list
+     * @param searchDto Search DTO instance
+     * @param fetchPaths Set to collect fetch paths
+     */
+    private void collectFetchPaths(List<FieldMetadata> fields, Object searchDto, java.util.Set<String> fetchPaths) {
+        for (FieldMetadata metadata : fields) {
+            try {
+                Object value = metadata.field().get(searchDto);
+                if (value == null) continue;
+
+                // Collect from @QueryTerm
+                if (metadata.queryTerm() != null && value instanceof String && !((String) value).isBlank()) {
+                    for (String path : metadata.queryTerm().value()) {
+                        extractRootPath(path, fetchPaths);
+                    }
+                }
+
+                // Collect from @QueryRange
+                if (metadata.queryRange() != null && value instanceof Range<?>) {
+                    extractRootPath(metadata.queryRange().value(), fetchPaths);
+                }
+
+                // Collect from @QueryPath
+                if (metadata.queryPath() != null) {
+                    extractRootPath(metadata.queryPath().value(), fetchPaths);
+                }
+
+            } catch (IllegalAccessException e) {
+                // Ignore
+            }
+        }
+    }
+
+    /**
+     * Extracts root path from a potentially nested path.
+     * Example: "author.firstName" → adds "author" to fetchPaths
+     *
+     * @param path Path expression
+     * @param fetchPaths Set to add root path
+     */
+    private void extractRootPath(String path, java.util.Set<String> fetchPaths) {
+        if (path.contains(".")) {
+            String rootPath = path.substring(0, path.indexOf("."));
+            fetchPaths.add(rootPath);
+        }
     }
 
     /**
